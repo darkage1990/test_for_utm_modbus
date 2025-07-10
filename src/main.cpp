@@ -18,129 +18,65 @@ constexpr uint8_t PIN_PWM = 27;
 
 // === PWM CONFIG ===
 constexpr uint8_t PWM_CHANNEL = 0;
-constexpr uint16_t PWM_RES = 10;        // 10-bit = 0–1023
-constexpr uint16_t DEFAULT_FREQ = 1000; // Hz
-constexpr uint8_t FIXED_DUTY = 50;      // %
-
-constexpr uint32_t INTERVAL_COILS = 300;
-constexpr uint32_t INTERVAL_ADC = 300;
-constexpr uint32_t INTERVAL_PWM = 300;
+constexpr uint16_t PWM_RES = 10;
+constexpr uint16_t DEFAULT_FREQ = 1000;
+constexpr uint8_t FIXED_DUTY = 50;
 
 // === EEPROM ===
 #define EEPROM_SIZE 8
-#define ADDR_PWM_FREQ 3 // uses addr 3 and 4
+#define ADDR_PWM_FREQ 3
 
-class ModbusController
+// === TASK HANDLES ===
+TaskHandle_t taskModbusHandle;
+TaskHandle_t taskADCHandle;
+TaskHandle_t taskPWMHandle;
+TaskHandle_t taskCoilHandle;
+
+// === Modbus Object ===
+ModbusRTU mb;
+
+// === Runtime State ===
+bool lastRedState = true;   // Start as HIGH (inactive)
+bool lastGreenState = true; // Start as HIGH (inactive)
+uint16_t currentPWMFreq = DEFAULT_FREQ;
+
+void setFixedDuty()
 {
-public:
-  ModbusController() : lastCoilUpdate(0), lastADCRead(0), lastPWMWrite(0),
-                       lastRedState(false), lastGreenState(false),
-                       currentPWMFreq(DEFAULT_FREQ) {}
+  int maxDuty = pow(2, PWM_RES) - 1;
+  int dutyVal = (FIXED_DUTY * maxDuty) / 100;
+  ledcWrite(PWM_CHANNEL, dutyVal);
+}
 
-  void begin()
-  {
-    Serial.begin(9600, SERIAL_8N1);
-    delay(100);
-    EEPROM.begin(EEPROM_SIZE);
+// === TASKS ===
 
-    mb.begin(&Serial);
-    mb.slave(SLAVE_ID);
-
-    // No EEPROM restore for coils (start all OFF)
-    mb.addCoil(COIL_RED, false);
-    mb.addCoil(COIL_GREEN, false);
-
-    // Restore PWM frequency from EEPROM
-    uint16_t freq = EEPROM.read(ADDR_PWM_FREQ) | (EEPROM.read(ADDR_PWM_FREQ + 1) << 8);
-    freq = constrain(freq, 10, 40000);
-    currentPWMFreq = freq;
-
-    mb.addHreg(REG_POT, 0);
-    mb.addHreg(REG_PWM_FREQ, currentPWMFreq);
-
-    pinMode(PIN_RED_LED, OUTPUT);
-    pinMode(PIN_GREEN_LED, OUTPUT);
-    pinMode(PIN_POT, INPUT);
-    pinMode(PIN_PWM, OUTPUT);
-
-    ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
-    ledcAttachPin(PIN_PWM, PWM_CHANNEL);
-    setFixedDuty();
-  }
-
-  void update()
+void taskModbus(void *param)
+{
+  while (true)
   {
     mb.task();
-    uint32_t now = millis();
-
-    if (now - lastCoilUpdate >= INTERVAL_COILS)
-    {
-      updateCoils();
-      lastCoilUpdate = now;
-    }
-
-    if (now - lastADCRead >= INTERVAL_ADC)
-    {
-      updateADC();
-      lastADCRead = now;
-    }
-
-    if (now - lastPWMWrite >= INTERVAL_PWM)
-    {
-      updatePWMFrequency();
-      lastPWMWrite = now;
-    }
+    vTaskDelay(5 / portTICK_PERIOD_MS); // Run frequently
   }
+}
 
-private:
-  ModbusRTU mb;
-  uint32_t lastCoilUpdate;
-  uint32_t lastADCRead;
-  uint32_t lastPWMWrite;
-  bool lastRedState;
-  bool lastGreenState;
-  uint16_t currentPWMFreq;
-
-  void updateCoils()
-  {
-    bool red = mb.Coil(COIL_RED);
-    bool green = mb.Coil(COIL_GREEN);
-
-    // Mutual exclusion: turn off the other if one turns on
-    if (red && !lastRedState)
-    {
-      mb.Coil(COIL_GREEN, false);
-    }
-    else if (green && !lastGreenState)
-    {
-      mb.Coil(COIL_RED, false);
-    }
-
-    // Refresh current states
-    bool finalRed = mb.Coil(COIL_RED);
-    bool finalGreen = mb.Coil(COIL_GREEN);
-
-    digitalWrite(PIN_RED_LED, finalRed ? HIGH : LOW);
-    digitalWrite(PIN_GREEN_LED, finalGreen ? HIGH : LOW);
-
-    lastRedState = red;
-    lastGreenState = green;
-  }
-
-  void updateADC()
+void taskADC(void *param)
+{
+  while (true)
   {
     int pot = analogRead(PIN_POT);
     mb.Hreg(REG_POT, pot);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
+}
 
-  void updatePWMFrequency()
+void taskPWM(void *param)
+{
+  while (true)
   {
-    uint16_t requestedFreq = mb.Hreg(REG_PWM_FREQ);
-    requestedFreq = constrain(requestedFreq, 10, 10000);
-
-    if (requestedFreq != currentPWMFreq)
+    uint16_t newFreq = mb.Hreg(REG_PWM_FREQ);
+    newFreq = constrain(newFreq, 10, 40000);
+    if (newFreq != currentPWMFreq)
     {
-      currentPWMFreq = requestedFreq;
+      currentPWMFreq = newFreq;
       ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
       setFixedDuty();
 
@@ -149,25 +85,80 @@ private:
       EEPROM.write(ADDR_PWM_FREQ + 1, (currentPWMFreq >> 8) & 0xFF);
       EEPROM.commit();
     }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
+}
 
-  void setFixedDuty()
+void taskCoils(void *param)
+{
+  while (true)
   {
-    int maxDuty = pow(2, PWM_RES) - 1;
-    int dutyVal = (FIXED_DUTY * maxDuty) / 100;
-    ledcWrite(PWM_CHANNEL, dutyVal);
-  }
-};
+    bool red = !mb.Coil(COIL_RED);     // LOW = ACTIVE
+    bool green = !mb.Coil(COIL_GREEN); // LOW = ACTIVE
 
-// === INSTANCE ===
-ModbusController modbusController;
+    if (red && lastRedState)
+    {
+      mb.Coil(COIL_GREEN, true); // force other to HIGH (inactive)
+    }
+    else if (green && lastGreenState)
+    {
+      mb.Coil(COIL_RED, true); // force other to HIGH (inactive)
+    }
+
+    // Reflect logic LOW = active
+    digitalWrite(PIN_RED_LED, mb.Coil(COIL_RED)); // true = HIGH (inactive), false = LOW (active)
+    digitalWrite(PIN_GREEN_LED, mb.Coil(COIL_GREEN));
+
+    lastRedState = mb.Coil(COIL_RED);
+    lastGreenState = mb.Coil(COIL_GREEN);
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// === SETUP ===
 
 void setup()
 {
-  modbusController.begin();
+  Serial.begin(9600, SERIAL_8N1);
+  delay(100);
+  EEPROM.begin(EEPROM_SIZE);
+
+  mb.begin(&Serial);
+  mb.slave(SLAVE_ID);
+
+  // Coils default to HIGH (inactive)
+  mb.addCoil(COIL_RED, true);
+  mb.addCoil(COIL_GREEN, true);
+
+  // Restore PWM frequency from EEPROM
+  uint16_t freq = EEPROM.read(ADDR_PWM_FREQ) | (EEPROM.read(ADDR_PWM_FREQ + 1) << 8);
+  freq = constrain(freq, 10, 40000);
+  currentPWMFreq = freq;
+
+  mb.addHreg(REG_POT, 0);
+  mb.addHreg(REG_PWM_FREQ, currentPWMFreq);
+
+  pinMode(PIN_RED_LED, OUTPUT);
+  pinMode(PIN_GREEN_LED, OUTPUT);
+  pinMode(PIN_POT, INPUT);
+  pinMode(PIN_PWM, OUTPUT);
+
+  digitalWrite(PIN_RED_LED, HIGH);
+  digitalWrite(PIN_GREEN_LED, HIGH);
+
+  ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
+  ledcAttachPin(PIN_PWM, PWM_CHANNEL);
+  setFixedDuty();
+
+  // Start FreeRTOS tasks
+  xTaskCreatePinnedToCore(taskModbus, "ModbusTask", 4096, nullptr, 1, &taskModbusHandle, 0);
+  xTaskCreatePinnedToCore(taskADC, "ADCTask", 2048, nullptr, 1, &taskADCHandle, 1);
+  xTaskCreatePinnedToCore(taskPWM, "PWMTask", 2048, nullptr, 1, &taskPWMHandle, 1);
+  xTaskCreatePinnedToCore(taskCoils, "CoilTask", 2048, nullptr, 1, &taskCoilHandle, 1);
 }
 
 void loop()
 {
-  modbusController.update();
+  // Nothing here — everything is in RTOS tasks
 }
