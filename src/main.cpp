@@ -18,8 +18,8 @@ constexpr uint8_t PIN_PWM = 27;
 
 // === PWM CONFIG ===
 constexpr uint8_t PWM_CHANNEL = 0;
-constexpr uint16_t PWM_RES = 10;
-constexpr uint16_t DEFAULT_FREQ = 1000;
+constexpr uint16_t PWM_RES = 8;
+constexpr uint32_t MAX_PWM_FREQ = 100000;
 constexpr uint8_t FIXED_DUTY = 50;
 
 // === EEPROM ===
@@ -30,8 +30,8 @@ constexpr uint8_t FIXED_DUTY = 50;
 TaskHandle_t taskModbusHandle;
 TaskHandle_t taskADCHandle;
 TaskHandle_t taskPWMHandle;
-TaskHandle_t taskRedHandle;
-TaskHandle_t taskGreenHandle;
+TaskHandle_t taskCoilRedHandle;
+TaskHandle_t taskCoilGreenHandle;
 
 // === Modbus Object ===
 ModbusRTU mb;
@@ -39,8 +39,7 @@ ModbusRTU mb;
 // === Runtime State ===
 bool lastRedState = true;   // Start as HIGH (inactive)
 bool lastGreenState = true; // Start as HIGH (inactive)
-bool pwmEnabled = false;
-uint16_t currentPWMFreq = DEFAULT_FREQ;
+uint32_t currentPWMFreq = 1000;
 
 void setFixedDuty()
 {
@@ -74,14 +73,16 @@ void taskPWM(void *param)
 {
   while (true)
   {
-    uint16_t newFreq = mb.Hreg(REG_PWM_FREQ);
-    newFreq = constrain(newFreq, 10, 40000);
+    uint16_t regValue = mb.Hreg(REG_PWM_FREQ);
+    regValue = constrain(regValue, 0, 100);
+    uint32_t newFreq = map(regValue, 1, 100, 1000, MAX_PWM_FREQ);
+    newFreq = constrain(newFreq, 1, MAX_PWM_FREQ);
+
     if (newFreq != currentPWMFreq)
     {
       currentPWMFreq = newFreq;
       ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
-      if (pwmEnabled)
-        setFixedDuty();
+      setFixedDuty();
 
       EEPROM.write(ADDR_PWM_FREQ, currentPWMFreq & 0xFF);
       EEPROM.write(ADDR_PWM_FREQ + 1, (currentPWMFreq >> 8) & 0xFF);
@@ -91,48 +92,22 @@ void taskPWM(void *param)
   }
 }
 
-void taskRedCoil(void *param)
+void taskCoilRed(void *param)
 {
   while (true)
   {
-    bool red = !mb.Coil(COIL_RED);     // LOW = ACTIVE
-    bool green = !mb.Coil(COIL_GREEN); // LOW = ACTIVE
-
-    if (green)
-    {
-      digitalWrite(PIN_RED_LED, mb.Coil(COIL_RED));
-    }
-    else
-    {
-      digitalWrite(PIN_RED_LED, HIGH); // Disable RED output if system OFF
-    }
-
+    digitalWrite(PIN_RED_LED, mb.Coil(COIL_RED));
     lastRedState = mb.Coil(COIL_RED);
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-void taskGreenCoil(void *param)
+void taskCoilGreen(void *param)
 {
   while (true)
   {
-    bool green = !mb.Coil(COIL_GREEN); // LOW = ACTIVE
-
-    if (green && !pwmEnabled)
-    {
-      ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
-      setFixedDuty();
-      pwmEnabled = true;
-    }
-    else if (!green && pwmEnabled)
-    {
-      ledcWrite(PWM_CHANNEL, 0); // Stop PWM
-      pwmEnabled = false;
-    }
-
     digitalWrite(PIN_GREEN_LED, mb.Coil(COIL_GREEN));
     lastGreenState = mb.Coil(COIL_GREEN);
-
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
@@ -141,6 +116,7 @@ void taskGreenCoil(void *param)
 
 void setup()
 {
+  setCpuFrequencyMhz(240);
   Serial.begin(9600);
   EEPROM.begin(EEPROM_SIZE);
 
@@ -151,11 +127,13 @@ void setup()
   mb.addCoil(COIL_GREEN, true);
 
   uint16_t freq = EEPROM.read(ADDR_PWM_FREQ) | (EEPROM.read(ADDR_PWM_FREQ + 1) << 8);
-  freq = constrain(freq, 10, 40000);
+  freq = constrain(freq, 10, MAX_PWM_FREQ);
   currentPWMFreq = freq;
 
+  // Map EEPROM freq back to 0–100 for register
+  uint16_t regValue = map(currentPWMFreq, 1000, MAX_PWM_FREQ, 1, 100);
   mb.addHreg(REG_POT, 0);
-  mb.addHreg(REG_PWM_FREQ, currentPWMFreq);
+  mb.addHreg(REG_PWM_FREQ, regValue);
 
   pinMode(PIN_RED_LED, OUTPUT);
   pinMode(PIN_GREEN_LED, OUTPUT);
@@ -172,8 +150,8 @@ void setup()
   xTaskCreatePinnedToCore(taskModbus, "ModbusTask", 4096, nullptr, 1, &taskModbusHandle, 0);
   xTaskCreatePinnedToCore(taskADC, "ADCTask", 2048, nullptr, 1, &taskADCHandle, 1);
   xTaskCreatePinnedToCore(taskPWM, "PWMTask", 2048, nullptr, 1, &taskPWMHandle, 1);
-  xTaskCreatePinnedToCore(taskRedCoil, "RedTask", 2048, nullptr, 1, &taskRedHandle, 1);
-  xTaskCreatePinnedToCore(taskGreenCoil, "GreenTask", 2048, nullptr, 1, &taskGreenHandle, 1);
+  xTaskCreatePinnedToCore(taskCoilRed, "CoilRedTask", 2048, nullptr, 1, &taskCoilRedHandle, 1);
+  xTaskCreatePinnedToCore(taskCoilGreen, "CoilGreenTask", 2048, nullptr, 1, &taskCoilGreenHandle, 1);
 }
 
 void loop()
