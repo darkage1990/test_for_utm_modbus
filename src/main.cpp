@@ -5,8 +5,8 @@
 // === MODBUS CONFIG ===
 #define SLAVE_ID 1
 
-constexpr uint16_t COIL_RED = 1;
-constexpr uint16_t COIL_GREEN = 2;
+constexpr uint16_t COIL_RED = 1;   // Forward/Reverse toggle
+constexpr uint16_t COIL_GREEN = 2; // Power ON toggle
 constexpr uint16_t REG_POT = 10;
 constexpr uint16_t REG_PWM_FREQ = 11;
 
@@ -30,7 +30,8 @@ constexpr uint8_t FIXED_DUTY = 50;
 TaskHandle_t taskModbusHandle;
 TaskHandle_t taskADCHandle;
 TaskHandle_t taskPWMHandle;
-TaskHandle_t taskCoilHandle;
+TaskHandle_t taskRedHandle;
+TaskHandle_t taskGreenHandle;
 
 // === Modbus Object ===
 ModbusRTU mb;
@@ -38,6 +39,7 @@ ModbusRTU mb;
 // === Runtime State ===
 bool lastRedState = true;   // Start as HIGH (inactive)
 bool lastGreenState = true; // Start as HIGH (inactive)
+bool pwmEnabled = false;
 uint16_t currentPWMFreq = DEFAULT_FREQ;
 
 void setFixedDuty()
@@ -54,7 +56,7 @@ void taskModbus(void *param)
   while (true)
   {
     mb.task();
-    vTaskDelay(5 / portTICK_PERIOD_MS); // Run frequently
+    vTaskDelay(5 / portTICK_PERIOD_MS);
   }
 }
 
@@ -78,9 +80,9 @@ void taskPWM(void *param)
     {
       currentPWMFreq = newFreq;
       ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
-      setFixedDuty();
+      if (pwmEnabled)
+        setFixedDuty();
 
-      // Save to EEPROM
       EEPROM.write(ADDR_PWM_FREQ, currentPWMFreq & 0xFF);
       EEPROM.write(ADDR_PWM_FREQ + 1, (currentPWMFreq >> 8) & 0xFF);
       EEPROM.commit();
@@ -89,27 +91,46 @@ void taskPWM(void *param)
   }
 }
 
-void taskCoils(void *param)
+void taskRedCoil(void *param)
 {
   while (true)
   {
     bool red = !mb.Coil(COIL_RED);     // LOW = ACTIVE
     bool green = !mb.Coil(COIL_GREEN); // LOW = ACTIVE
 
-    if (red && lastRedState)
+    if (green)
     {
-      mb.Coil(COIL_GREEN, true); // force other to HIGH (inactive)
+      digitalWrite(PIN_RED_LED, mb.Coil(COIL_RED));
     }
-    else if (green && lastGreenState)
+    else
     {
-      mb.Coil(COIL_RED, true); // force other to HIGH (inactive)
+      digitalWrite(PIN_RED_LED, HIGH); // Disable RED output if system OFF
     }
-
-    // Reflect logic LOW = active
-    digitalWrite(PIN_RED_LED, mb.Coil(COIL_RED)); // true = HIGH (inactive), false = LOW (active)
-    digitalWrite(PIN_GREEN_LED, mb.Coil(COIL_GREEN));
 
     lastRedState = mb.Coil(COIL_RED);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+void taskGreenCoil(void *param)
+{
+  while (true)
+  {
+    bool green = !mb.Coil(COIL_GREEN); // LOW = ACTIVE
+
+    if (green && !pwmEnabled)
+    {
+      ledcSetup(PWM_CHANNEL, currentPWMFreq, PWM_RES);
+      setFixedDuty();
+      pwmEnabled = true;
+    }
+    else if (!green && pwmEnabled)
+    {
+      ledcWrite(PWM_CHANNEL, 0); // Stop PWM
+      pwmEnabled = false;
+    }
+
+    digitalWrite(PIN_GREEN_LED, mb.Coil(COIL_GREEN));
     lastGreenState = mb.Coil(COIL_GREEN);
 
     vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -120,18 +141,15 @@ void taskCoils(void *param)
 
 void setup()
 {
-  Serial.begin(9600, SERIAL_8N1);
-  delay(100);
+  Serial.begin(9600);
   EEPROM.begin(EEPROM_SIZE);
 
   mb.begin(&Serial);
   mb.slave(SLAVE_ID);
 
-  // Coils default to HIGH (inactive)
   mb.addCoil(COIL_RED, true);
   mb.addCoil(COIL_GREEN, true);
 
-  // Restore PWM frequency from EEPROM
   uint16_t freq = EEPROM.read(ADDR_PWM_FREQ) | (EEPROM.read(ADDR_PWM_FREQ + 1) << 8);
   freq = constrain(freq, 10, 40000);
   currentPWMFreq = freq;
@@ -151,14 +169,13 @@ void setup()
   ledcAttachPin(PIN_PWM, PWM_CHANNEL);
   setFixedDuty();
 
-  // Start FreeRTOS tasks
   xTaskCreatePinnedToCore(taskModbus, "ModbusTask", 4096, nullptr, 1, &taskModbusHandle, 0);
   xTaskCreatePinnedToCore(taskADC, "ADCTask", 2048, nullptr, 1, &taskADCHandle, 1);
   xTaskCreatePinnedToCore(taskPWM, "PWMTask", 2048, nullptr, 1, &taskPWMHandle, 1);
-  xTaskCreatePinnedToCore(taskCoils, "CoilTask", 2048, nullptr, 1, &taskCoilHandle, 1);
+  xTaskCreatePinnedToCore(taskRedCoil, "RedTask", 2048, nullptr, 1, &taskRedHandle, 1);
+  xTaskCreatePinnedToCore(taskGreenCoil, "GreenTask", 2048, nullptr, 1, &taskGreenHandle, 1);
 }
 
 void loop()
 {
-  // Nothing here — everything is in RTOS tasks
 }
