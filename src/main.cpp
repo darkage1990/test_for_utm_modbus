@@ -118,7 +118,7 @@ void taskPWM(void *param)
                   state.pwmFreq,
                   state.coilPwr ? "ON" : "OFF");
 
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -136,7 +136,7 @@ void taskCoils(void *param)
                   state.coilDir ? "Forward" : "Reverse",
                   state.coilPwr ? "ON" : "OFF");
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
